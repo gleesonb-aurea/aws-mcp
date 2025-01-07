@@ -11,6 +11,10 @@ import * as AWS from "aws-sdk";
 import open from "open";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 
+const createTextResponse = (text: string) => ({
+  content: [{ type: "text", text }],
+});
+
 const codePrompt = `Your job is to answer questions about AWS environment by writing Javascript code using AWS SDK V2. The code must be adhering to a few rules:
 - Must be preferring promises over callbacks
 - Think step-by-step before writing the code, approach it logically
@@ -212,21 +216,21 @@ function wrapUserCode(userCode: string) {
 async function listCredentials() {
   let credentials: any;
   let configs: any;
-  let error: any;
+  let credError: string | undefined;
   try {
     credentials = new AWS.IniLoader().loadFrom({});
-  } catch (error) {
-    error = `Failed to load credentials: ${error}`;
+  } catch (err) {
+    credError = `Failed to load credentials: ${err instanceof Error ? err.message : String(err)}`;
   }
   try {
     configs = new AWS.IniLoader().loadFrom({ isConfig: true });
-  } catch (error) {
-    error = `Failed to load configs: ${error}`;
+  } catch (err) {
+    const msg = `Failed to load configs: ${err instanceof Error ? err.message : String(err)}`;
+    credError = credError ? `${credError}; ${msg}` : msg;
   }
 
   const profiles = { ...(credentials || {}), ...(configs || {}) };
-
-  return { profiles, error };
+  return { profiles, error: credError };
 }
 
 async function getCredentials(
@@ -256,10 +260,15 @@ async function getCredentials(
     }
 
     let handleId: NodeJS.Timeout;
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        clearInterval(handleId);
+        reject(new Error('SSO authentication timed out after 60 seconds'));
+      }, 60000); // 60 second timeout
+
       handleId = setInterval(async () => {
         try {
-          const createTokenReponse = await oidc
+          const createTokenResponse = await oidc
             .createToken({
               clientId: registration.clientId!,
               clientSecret: registration.clientSecret!,
@@ -268,23 +277,25 @@ async function getCredentials(
             })
             .promise();
 
+          if (!createTokenResponse.accessToken) {
+            throw new Error('No access token received');
+          }
+
           const sso = new AWS.SSO({ region });
 
           const credentials = await sso
             .getRoleCredentials({
-              accessToken: createTokenReponse.accessToken!,
+              accessToken: createTokenResponse.accessToken,
               accountId: creds.sso_account_id,
               roleName: creds.sso_role_name,
             })
             .promise();
 
           clearInterval(handleId);
-
-          return resolve(credentials.roleCredentials!);
+          clearTimeout(timeout);
+          resolve(credentials.roleCredentials!);
         } catch (error) {
-          if ((error as Error).message !== null) {
-            // terminal.error(error);
-          }
+          console.error('SSO error:', error instanceof Error ? error.message : String(error));
         }
       }, 2500);
     });
@@ -332,8 +343,4 @@ export const useAWSCredentialsProvider = (
 const transport = new StdioServerTransport();
 server.connect(transport).then(() => {
   console.error("Local Machine MCP Server running on stdio");
-});
-
-const createTextResponse = (text: string) => ({
-  content: [{ type: "text", text }],
 });
